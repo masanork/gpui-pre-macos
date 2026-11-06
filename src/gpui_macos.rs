@@ -1,5 +1,8 @@
 // Modified by ibis inc. for ibisOffice (2026-10-01): re-exports `set_font_smoothing`.
 #![cfg(target_os = "macos")]
+// Modified by ibis inc. for ibisOffice (2026-11-07): the cocoa/objc crates are deprecated in favour of objc2.
+// Moving to objc2 is a large change, so the deprecation warnings are silenced for this crate.
+#![allow(deprecated)]
 //! macOS platform implementation for GPUI.
 //!
 //! macOS screens have a y axis that goes up from the bottom of the screen and
