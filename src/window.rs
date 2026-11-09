@@ -3483,6 +3483,33 @@ extern "C" fn set_marked_text(
     unsafe {
         let is_attributed_string: BOOL =
             msg_send![text, isKindOfClass: [class!(NSAttributedString)]];
+        // Modified by ibis inc.: the input method marks the clause it is converting with a thick underline
+        // (NSUnderlineStyleThick, 0x02) in the attributed string, the others with a thin one. UTF-16 units, as NSRange.
+        let target = if is_attributed_string == YES {
+            let length: NSUInteger = msg_send![text, length];
+            let name = ns_string("NSUnderline");
+            let mut index: NSUInteger = 0;
+            let mut found: Option<Range<usize>> = None;
+            while index < length {
+                let mut effective = NSRange { location: 0, length: 0 };
+                let value: id = msg_send![text, attribute: name atIndex: index effectiveRange: &mut effective as *mut NSRange as *mut c_void];
+                let next = (effective.location + effective.length).max(index + 1);
+                if value != nil {
+                    let style: isize = msg_send![value, integerValue];
+                    if style & 0x02 != 0 {
+                        let end = next.min(length);
+                        found = Some(match found {
+                            Some(f) => f.start..end,
+                            None => index..end,
+                        });
+                    }
+                }
+                index = next;
+            }
+            found
+        } else {
+            None
+        };
         let text: id = if is_attributed_string == YES {
             msg_send![text, string]
         } else {
@@ -3492,7 +3519,9 @@ extern "C" fn set_marked_text(
         let replacement_range = replacement_range.to_range();
         let text = text.to_str();
         with_input_handler(this, |input_handler| {
-            input_handler.replace_and_mark_text_in_range(replacement_range, text, selected_range)
+            input_handler.replace_and_mark_text_in_range(replacement_range, text, selected_range);
+            // Modified by ibis inc.: the clause being converted now.
+            input_handler.set_ime_target_range(target);
         });
     }
 }
