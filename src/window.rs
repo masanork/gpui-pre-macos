@@ -3497,7 +3497,8 @@ extern "C" fn set_marked_text(
                 if value != nil {
                     let style: isize = msg_send![value, integerValue];
                     if style & 0x02 != 0 {
-                        let end = next.min(length);
+                        let end = next.min(length) as usize;
+                        let index = index as usize;
                         found = Some(match found {
                             Some(f) => f.start..end,
                             None => index..end,
