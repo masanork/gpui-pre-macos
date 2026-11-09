@@ -26,7 +26,7 @@ use cocoa::{
 use dispatch2::DispatchQueue;
 use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
-    ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
+    ExternalPaths, FileDropEvent, ForegroundExecutor, ImeClause, ImeLine, KeyDownEvent, Keystroke, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
@@ -3483,33 +3483,27 @@ extern "C" fn set_marked_text(
     unsafe {
         let is_attributed_string: BOOL =
             msg_send![text, isKindOfClass: [class!(NSAttributedString)]];
-        // Modified by ibis inc.: the input method marks the clause it is converting with a thick underline
-        // (NSUnderlineStyleThick, 0x02) in the attributed string, the others with a thin one. UTF-16 units, as NSRange.
-        let target = if is_attributed_string == YES {
+        // Modified by ibis inc.: the clauses of the marked text with the line the input method gives each: the `NSUnderline`
+        // attribute (NSUnderlineStyleThick 0x02 thick, NSUnderlinePatternDot 0x100 dotted, else solid), as UTF-16 ranges of NSRange.
+        let clauses = if is_attributed_string == YES {
             let length: NSUInteger = msg_send![text, length];
             let name = ns_string("NSUnderline");
             let mut index: NSUInteger = 0;
-            let mut found: Option<Range<usize>> = None;
+            let mut found: Vec<ImeClause> = Vec::new();
             while index < length {
                 let mut effective = NSRange { location: 0, length: 0 };
                 let value: id = msg_send![text, attribute: name atIndex: index effectiveRange: &mut effective as *mut NSRange as *mut c_void];
-                let next = (effective.location + effective.length).max(index + 1);
+                let next = (effective.location + effective.length).max(index + 1).min(length);
                 if value != nil {
                     let style: isize = msg_send![value, integerValue];
-                    if style & 0x02 != 0 {
-                        let end = next.min(length) as usize;
-                        let index = index as usize;
-                        found = Some(match found {
-                            Some(f) => f.start..end,
-                            None => index..end,
-                        });
-                    }
+                    let line = if style & 0x700 == 0x100 { ImeLine::Dotted } else { ImeLine::Solid };
+                    found.push(ImeClause { range: index as usize..next as usize, thick: style & 0x0f == 0x02, line });
                 }
                 index = next;
             }
             found
         } else {
-            None
+            Vec::new()
         };
         let text: id = if is_attributed_string == YES {
             msg_send![text, string]
@@ -3521,8 +3515,7 @@ extern "C" fn set_marked_text(
         let text = text.to_str();
         with_input_handler(this, |input_handler| {
             input_handler.replace_and_mark_text_in_range(replacement_range, text, selected_range);
-            // Modified by ibis inc.: the clause being converted now.
-            input_handler.set_ime_target_range(target);
+            input_handler.set_ime_clauses(clauses);
         });
     }
 }
