@@ -3419,7 +3419,17 @@ extern "C" fn first_rect_for_character_range(
 ) -> NSRect {
     let frame = get_frame(this);
     with_input_handler(this, |input_handler| {
-        input_handler.bounds_for_range(range.to_range()?)
+        let range = range.to_range()?;
+        // Modified by ibis inc.: while text is being composed, the rectangle for the marked text is the LAST line of it (the start
+        // of that line), so the candidate window opens under the last typed character and not over a wrapped part of the text.
+        if let Some(marked) = input_handler.marked_text_range() {
+            if range.start >= marked.start && range.end <= marked.end {
+                if let Some(bounds) = input_handler.ime_candidate_bounds() {
+                    return Some(bounds);
+                }
+            }
+        }
+        input_handler.bounds_for_range(range)
     })
     .flatten()
     .map_or(
