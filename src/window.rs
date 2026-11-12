@@ -3506,15 +3506,32 @@ extern "C" fn set_marked_text(
                 let next = (effective.location + effective.length).max(index + 1).min(length);
                 if value != nil {
                     let style: isize = msg_send![value, integerValue];
-                    let line = if style & 0x700 == 0x100 { ImeLine::Dotted } else { ImeLine::Solid };
+                    // Any pattern bit (dot 0x100, dash 0x200, dash-dot 0x300, dash-dot-dot 0x400) is a broken line: the text not converted yet.
+                    let line = if style & 0x700 != 0 { ImeLine::Dotted } else { ImeLine::Solid };
+                    if std::env::var_os("IBIS_IME_LOG").is_some() {
+                        eprintln!("ime setMarkedText clause {}..{} NSUnderline={style:#x}", index, next);
+                    }
                     found.push(ImeClause { range: index as usize..next as usize, thick: style & 0x0f == 0x02, line });
                 }
                 index = next;
             }
             found
         } else {
-            Vec::new()
+            // A plain string says nothing about its clauses: all of it is text still being typed.
+            let length: NSUInteger = msg_send![text, length];
+            if length > 0 { vec![ImeClause { range: 0..length as usize, thick: false, line: ImeLine::Dotted }] } else { Vec::new() }
         };
+        // The input method marks the clause it converts with a thick line. When none is thick the text is still being typed (not converted
+        // yet): the line of those is broken, as Word's and the macOS native text fields' are, whatever pattern the input method sent.
+        let mut clauses = clauses;
+        if !clauses.is_empty() && !clauses.iter().any(|c| c.thick) {
+            for c in &mut clauses {
+                c.line = ImeLine::Dotted;
+            }
+        }
+        if std::env::var_os("IBIS_IME_LOG").is_some() {
+            eprintln!("ime setMarkedText attributed={} clauses={clauses:?} selected={:?}", is_attributed_string == YES, selected_range.to_range());
+        }
         let text: id = if is_attributed_string == YES {
             msg_send![text, string]
         } else {
