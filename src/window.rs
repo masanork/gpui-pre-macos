@@ -2166,6 +2166,16 @@ impl PlatformWindow for MacWindow {
             .detach()
     }
 
+    // Modified by ibis inc. for ibisOffice (2026-11-14): ends the composition session of the input method (issue 202).
+    fn discard_marked_text(&self) {
+        unsafe {
+            let input_context: id = msg_send![class!(NSTextInputContext), currentInputContext];
+            if !input_context.is_null() {
+                let _: () = msg_send![input_context, discardMarkedText];
+            }
+        }
+    }
+
     fn titlebar_double_click(&self, is_resizable: bool, is_minimizable: bool) {
         let this = self.0.lock();
         if this.simple_fullscreen_state.is_some() {
