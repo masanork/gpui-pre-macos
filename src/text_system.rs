@@ -407,10 +407,11 @@ impl MacTextSystemState {
 
         let mut font_ids = SmallVec::new();
         let mut postscript_names_seen = HashSet::default();
-        let family = self
-            .memory_source
-            .select_family_by_name(name)
-            .or_else(|_| self.system_source.select_family_by_name(name))?;
+        // (Modified by ibis inc.: whether the family is one that was added by `add_fonts`; see the 'm' check below.)
+        let (family, added) = match self.memory_source.select_family_by_name(name) {
+            Ok(family) => (family, true),
+            Err(_) => (self.system_source.select_family_by_name(name)?, false),
+        };
         for font in family.fonts() {
             let mut font = font.load()?;
 
@@ -430,7 +431,11 @@ impl MacTextSystemState {
                 // the Storybook (on macOS).
                 let is_segoe_fluent_icons = font.full_name() == "Segoe Fluent Icons";
 
-                if !has_m_glyph && !is_segoe_fluent_icons {
+                // Modified by ibis inc.: a font that was added by `add_fonts` (the setup's downloads) is loaded without an 'm' too.
+                // The Digital Agency's Add Character_GJMincho has only the characters of its own (the Plane 16 private use
+                // area and the like, no Latin letters), and with this check the family was "not found" and a document set in it
+                // was drawn in Helvetica (#158). Text laid out with it still falls back for the characters it lacks.
+                if !has_m_glyph && !is_segoe_fluent_icons && !added {
                     // I spent far too long trying to track down why a font missing the 'm'
                     // character wasn't loading. This log statement will hopefully save
                     // someone else from suffering the same fate.
