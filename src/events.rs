@@ -82,7 +82,7 @@ pub fn key_to_native(key: &str) -> Cow<'_, str> {
     Cow::Owned(String::from_utf16(&[code]).unwrap())
 }
 
-unsafe fn read_modifiers(native_event: id) -> Modifiers {
+pub(crate) unsafe fn read_modifiers(native_event: id) -> Modifiers {
     unsafe {
         let modifiers = native_event.modifierFlags();
         let control = modifiers.contains(NSEventModifierFlags::NSControlKeyMask);
