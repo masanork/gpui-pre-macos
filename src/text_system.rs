@@ -79,6 +79,10 @@ struct MacTextSystemState {
     /// Fonts loaded with the `kern` feature set to 0, laid out without
     /// kerning (CoreText does not turn kerning off for the feature alone).
     unkerned: HashSet<FontId>,
+    // CoreText's cascade can return LastResort for a supplementary PUA even
+    // when the configured fallback has a cmap entry. Keep that face available
+    // for explicit assignment without selecting it as a primary metrics font.
+    administrative_fallbacks: HashMap<FontId, FontKitFont>,
     /// The CTFont of a font at a size, by font and the size's bits: creating
     /// one for every line made CoreText set up the font's tables each time
     /// (half of the time of laying out a line).
@@ -124,6 +128,7 @@ impl MacTextSystem {
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
             unkerned: HashSet::default(),
+            administrative_fallbacks: HashMap::default(),
             sized_fonts: HashMap::default(),
             font_files: HashMap::default(),
             added_font_data: HashMap::default(),
@@ -225,6 +230,21 @@ impl PlatformTextSystem for MacTextSystem {
             );
             if want_bold || want_italic {
                 lock.wanted_styles.insert(font_id, (want_bold, want_italic));
+            }
+            if let Some(fallbacks) = font.fallbacks.as_ref() {
+                for family in fallbacks.fallback_list() {
+                    if !matches!(family.as_str(), "Add Character_GJMincho" | "追加文字行政事務標準明朝") {
+                        continue;
+                    }
+                    let found = lock.memory_source.select_family_by_name(family)
+                        .or_else(|_| lock.system_source.select_family_by_name(family));
+                    if let Ok(found) = found
+                        && let Some(face) = found.fonts().iter().find_map(|handle| handle.load().ok())
+                    {
+                        lock.administrative_fallbacks.insert(font_id, face);
+                        break;
+                    }
+                }
             }
             lock.font_selections.insert(font.clone(), font_id);
             Ok(font_id)
@@ -770,6 +790,33 @@ impl MacTextSystemState {
                     string.set_attribute(cf_range, kCTFontAttributeName, &sized);
                     if self.unkerned.contains(&run.font_id) {
                         string.set_attribute(cf_range, kCTKernAttributeName, &CFNumber::from(0.0f64));
+                    }
+                }
+                if let Some(admin) = self.administrative_fallbacks.get(&run.font_id) {
+                    let text_run = if utf16_start == 0 && text_run.encode_utf16().count() as isize != length {
+                        text_run.trim_start_matches('\u{feff}')
+                    } else {
+                        text_run
+                    };
+                    let mut offset = utf16_start;
+                    let mut chars = text_run.chars().peekable();
+                    let mut fallback = None;
+                    while let Some(c) = chars.next() {
+                        let width = c.len_utf16() as isize;
+                        let has_selector = chars.peek().copied().or_else(|| text.chars().next())
+                            .is_some_and(|next| matches!(next as u32, 0xfe00..=0xfe0f | 0xe0100..=0xe01ef));
+                        if matches!(c as u32, 0x100000..=0x10fffd)
+                            && offset + width <= utf16_end
+                            && !has_selector
+                            && font.glyph_for_char(c).is_none()
+                            && admin.glyph_for_char(c).is_some()
+                        {
+                            let fallback = fallback.get_or_insert_with(|| admin.native_font().clone_with_font_size(font_size.into()));
+                            unsafe {
+                                string.set_attribute(CFRange::init(offset, width), kCTFontAttributeName, fallback);
+                            }
+                        }
+                        offset += width;
                     }
                 }
                 break_ligature = !break_ligature;
