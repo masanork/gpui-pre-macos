@@ -3,6 +3,7 @@
 // Modified by ibis inc. for ibisOffice (2026-10-11): `layout_line` keeps the sized CTFont of each (font, size), instead of creating one for every line.
 // Modified by ibis inc. for ibisOffice (2026-10-01): `set_font_smoothing` turns CoreGraphics' font smoothing (which thickens glyph stems) off for the glyphs rasterized after it.
 // Modified by ibis inc. for ibisOffice (2026-10-20): bold or italic asked of a family without that face (Japanese fonts) is drawn emboldened (filled and outlined) or slanted (through the font's matrix), fallback fonts too.
+// Modified by masanork and ibis inc. for ibisOffice (2026-11-18): a configured administrative fallback (追加文字行政事務標準明朝) is assigned to the supplementary private-use characters directly, where CoreText's cascade chose LastResort (#251; masanork's change, taken with the author's agreement to the CLA).
 use anyhow::anyhow;
 use cocoa::appkit::CGFloat;
 use collections::{HashMap, HashSet};
@@ -427,10 +428,11 @@ impl MacTextSystemState {
 
         let mut font_ids = SmallVec::new();
         let mut postscript_names_seen = HashSet::default();
-        let family = self
-            .memory_source
-            .select_family_by_name(name)
-            .or_else(|_| self.system_source.select_family_by_name(name))?;
+        // (Modified by ibis inc.: whether the family is one that was added by `add_fonts`; see the 'm' check below.)
+        let (family, added) = match self.memory_source.select_family_by_name(name) {
+            Ok(family) => (family, true),
+            Err(_) => (self.system_source.select_family_by_name(name)?, false),
+        };
         for font in family.fonts() {
             let mut font = font.load()?;
 
@@ -450,7 +452,11 @@ impl MacTextSystemState {
                 // the Storybook (on macOS).
                 let is_segoe_fluent_icons = font.full_name() == "Segoe Fluent Icons";
 
-                if !has_m_glyph && !is_segoe_fluent_icons {
+                // Modified by ibis inc.: a font that was added by `add_fonts` (the setup's downloads) is loaded without an 'm' too.
+                // The Digital Agency's Add Character_GJMincho has only the characters of its own (the Plane 16 private use
+                // area and the like, no Latin letters), and with this check the family was "not found" and a document set in it
+                // was drawn in Helvetica (#158). Text laid out with it still falls back for the characters it lacks.
+                if !has_m_glyph && !is_segoe_fluent_icons && !added {
                     // I spent far too long trying to track down why a font missing the 'm'
                     // character wasn't loading. This log statement will hopefully save
                     // someone else from suffering the same fate.

@@ -31,7 +31,7 @@ use gpui::{
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
-    WindowParams, WindowVisibility, point, px, size,
+    TouchPhase, TouchSessionEvent, WindowParams, WindowVisibility, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -210,6 +210,27 @@ unsafe fn build_classes() {
             decl.add_method(
                 sel!(magnifyWithEvent:),
                 handle_view_event as extern "C" fn(&Object, Sel, id),
+            );
+            // Modified by ibis inc. (#209): the fingers of a touch screen (NSTouch of the direct type).
+            decl.add_method(
+                sel!(acceptsTouchEvents),
+                accepts_touch_events as extern "C" fn(&Object, Sel) -> BOOL,
+            );
+            decl.add_method(
+                sel!(touchesBeganWithEvent:),
+                handle_touch_event as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(touchesMovedWithEvent:),
+                handle_touch_event as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(touchesEndedWithEvent:),
+                handle_touch_event as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(touchesCancelledWithEvent:),
+                handle_touch_event as extern "C" fn(&Object, Sel, id),
             );
             decl.add_method(
                 sel!(mouseDragged:),
@@ -715,6 +736,8 @@ struct MacWindowState {
     external_files_dragged: bool,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
+    // Touch screen fingers (NSTouch of the direct type; ibis inc., #209).
+    touch: MacTouch,
     // When true, the whole content view is reported as app-owned titlebar content via
     // `_opaqueRectForWindowMoveWhenInTitlebar`, so AppKit does not drag the window from
     // the titlebar or delay titlebar clicks (a delay first observed on macOS 27). Such
@@ -1155,6 +1178,7 @@ impl MacWindow {
                 do_command_handled: None,
                 external_files_dragged: false,
                 first_mouse: false,
+                touch: MacTouch::default(),
                 app_owns_titlebar_drag,
                 fullscreen_restore_bounds: Bounds::default(),
                 is_exiting_fullscreen: false,
@@ -2166,6 +2190,16 @@ impl PlatformWindow for MacWindow {
             .detach()
     }
 
+    // Modified by ibis inc. for ibisOffice (2026-11-14): ends the composition session of the input method (issue 202).
+    fn discard_marked_text(&self) {
+        unsafe {
+            let input_context: id = msg_send![class!(NSTextInputContext), currentInputContext];
+            if !input_context.is_null() {
+                let _: () = msg_send![input_context, discardMarkedText];
+            }
+        }
+    }
+
     fn titlebar_double_click(&self, is_resizable: bool, is_minimizable: bool) {
         let this = self.0.lock();
         if this.simple_fullscreen_state.is_some() {
@@ -2854,6 +2888,45 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let mut lock = window_state.as_ref().lock();
     let window_height = lock.content_size().height;
     let native_event_type = unsafe { native_event.eventType() };
+    // ibis inc. (#209): the mouse input AppKit makes of a touch (event subtype touch).
+    if matches!(
+        native_event_type,
+        NSEventType::NSLeftMouseDown | NSEventType::NSLeftMouseUp | NSEventType::NSLeftMouseDragged
+    ) && is_touch_mouse_event(native_event)
+    {
+        // The first finger's press, release (and the session around it); dropped after a pinch took the fingers.
+        if lock.touch.swallow_mouse {
+            if native_event_type == NSEventType::NSLeftMouseUp && !lock.touch.pinch.has_fingers() {
+                lock.touch.swallow_mouse = false;
+            }
+            return;
+        }
+        let position = lock.touch.last_position;
+        match native_event_type {
+            NSEventType::NSLeftMouseDown => {
+                lock.touch.mouse_seen = true;
+                // The session starts before the press it contains (the touch may not have been reported yet).
+                let start = !lock.touch.session_open;
+                lock.touch.session_open = true;
+                if start {
+                    drop(lock);
+                    dispatch_touch_input(
+                        &window_state,
+                        PlatformInput::TouchSession(TouchSessionEvent {
+                            phase: TouchPhase::Started,
+                            position,
+                        }),
+                    );
+                    lock = window_state.as_ref().lock();
+                }
+            }
+            NSEventType::NSLeftMouseUp => {
+                // The session ends after the release (below, once it was dispatched).
+                lock.touch.end_after_mouse_up = true;
+            }
+            _ => {}
+        }
+    }
     match native_event_type {
         NSEventType::NSLeftMouseDown => {
             // AppKit owns `native_event` for the callback; retain it so the drag session can still
@@ -3002,6 +3075,171 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
             drop(lock);
             callback(event);
             window_state.lock().event_callback = Some(callback);
+        }
+        // ibis inc. (#209): the touch's session ends after the release it contained.
+        let end = {
+            let mut lock = window_state.as_ref().lock();
+            let end = lock.touch.end_after_mouse_up && lock.touch.session_open;
+            lock.touch.end_after_mouse_up = false;
+            if end {
+                lock.touch.session_open = false;
+            }
+            end.then_some(lock.touch.last_position)
+        };
+        if let Some(position) = end {
+            dispatch_touch_input(
+                &window_state,
+                PlatformInput::TouchSession(TouchSessionEvent { phase: TouchPhase::Ended, position }),
+            );
+        }
+    }
+}
+
+// ----- touch screen fingers (ibis inc., #209) -----
+//
+// The first finger of a touch screen works like the mouse (AppKit turns it into mouse events of the touch subtype).
+// This follows the fingers (NSTouch, the direct type: not the trackpad's) through gpui's shared `PinchTracker`:
+// a second finger takes the first finger's press back (`TouchSessionEvent` `Cancelled`, no release) and starts a
+// pinch, and the mouse events of the touch are dropped until every finger is up.
+
+#[derive(Default)]
+struct MacTouch {
+    pinch: gpui::PinchTracker,
+    /// Mouse events of the touch are dropped (a pinch took the fingers over).
+    swallow_mouse: bool,
+    session_open: bool,
+    /// A mouse event of the touch came in this session (the session then ends after its release).
+    mouse_seen: bool,
+    end_after_mouse_up: bool,
+    last_position: Point<Pixels>,
+}
+
+const NS_EVENT_SUBTYPE_TOUCH: i16 = 3;
+
+fn is_touch_mouse_event(native_event: id) -> bool {
+    let subtype: i16 = unsafe { msg_send![native_event, subtype] };
+    subtype == NS_EVENT_SUBTYPE_TOUCH
+}
+
+extern "C" fn accepts_touch_events(_: &Object, _: Sel) -> BOOL {
+    YES
+}
+
+fn dispatch_touch_input(window_state: &Arc<Mutex<MacWindowState>>, input: PlatformInput) {
+    let callback = window_state.lock().event_callback.take();
+    if let Some(mut callback) = callback {
+        callback(input);
+        window_state.lock().event_callback = Some(callback);
+    }
+}
+
+extern "C" fn handle_touch_event(this: &Object, _: Sel, native_event: id) {
+    use gpui::{PinchDown, PinchEvent, PinchMove, PinchUp};
+    // NSTouchPhase: began 1, moved 2, stationary 4, ended 8, cancelled 16.
+    const ANY_PHASE: u64 = u64::MAX;
+    let window_state = unsafe { get_window_state(this) };
+    let (touches, height, modifiers): (id, Pixels, Modifiers) = unsafe {
+        let touches: id = msg_send![native_event, touchesMatchingPhase: ANY_PHASE inView: this as *const Object as id];
+        (touches, window_state.lock().content_size().height, crate::events::read_modifiers(native_event))
+    };
+    if touches.is_null() {
+        return;
+    }
+    let all: id = unsafe { msg_send![touches, allObjects] };
+    let count: usize = unsafe { msg_send![all, count] };
+    for i in 0..count {
+        let touch: id = unsafe { msg_send![all, objectAtIndex: i] };
+        // The trackpad's touches (indirect) are not fingers on the page.
+        let touch_type: i64 = unsafe { msg_send![touch, type] };
+        if touch_type != 0 {
+            continue;
+        }
+        let phase: u64 = unsafe { msg_send![touch, phase] };
+        let identity: id = unsafe { msg_send![touch, identity] };
+        let hash: usize = unsafe { msg_send![identity, hash] };
+        let id = hash as i64;
+        let at: NSPoint = unsafe { msg_send![touch, locationInView: this as *const Object as id] };
+        let position = point(px(at.x as f32), height - px(at.y as f32));
+        let mut inputs: Vec<PlatformInput> = Vec::new();
+        {
+            let mut lock = window_state.lock();
+            let touch = &mut lock.touch;
+            match phase {
+                1 => match touch.pinch.down(id, position) {
+                    PinchDown::Single => {
+                        touch.last_position = position;
+                        touch.swallow_mouse = false;
+                        touch.mouse_seen = false;
+                        if !touch.session_open {
+                            touch.session_open = true;
+                            inputs.push(PlatformInput::TouchSession(TouchSessionEvent {
+                                phase: TouchPhase::Started,
+                                position,
+                            }));
+                        }
+                    }
+                    PinchDown::Begin { cancelled, center } => {
+                        touch.swallow_mouse = true;
+                        if touch.session_open {
+                            touch.session_open = false;
+                            touch.end_after_mouse_up = false;
+                            inputs.push(PlatformInput::TouchSession(TouchSessionEvent {
+                                phase: TouchPhase::Cancelled,
+                                position: cancelled.1,
+                            }));
+                        }
+                        inputs.push(PlatformInput::Pinch(PinchEvent {
+                            position: center,
+                            delta: 0.0,
+                            modifiers,
+                            phase: TouchPhase::Started,
+                        }));
+                    }
+                    PinchDown::Ignored => {}
+                },
+                2 => match touch.pinch.moved(id, position) {
+                    PinchMove::Single => touch.last_position = position,
+                    PinchMove::Update { center, delta } => inputs.push(PlatformInput::Pinch(PinchEvent {
+                        position: center,
+                        delta,
+                        modifiers,
+                        phase: TouchPhase::Moved,
+                    })),
+                    PinchMove::Ignored => {}
+                },
+                8 | 16 => match touch.pinch.up(id, position) {
+                    PinchUp::Single => {
+                        touch.last_position = position;
+                        if phase == 16 && touch.session_open {
+                            touch.session_open = false;
+                            touch.swallow_mouse = true;
+                            inputs.push(PlatformInput::TouchSession(TouchSessionEvent {
+                                phase: TouchPhase::Cancelled,
+                                position,
+                            }));
+                        } else if touch.session_open && !touch.mouse_seen {
+                            // No mouse input was made of this touch: the session ends with the finger. (With mouse
+                            // input it ends after the release.)
+                            touch.session_open = false;
+                            inputs.push(PlatformInput::TouchSession(TouchSessionEvent {
+                                phase: TouchPhase::Ended,
+                                position,
+                            }));
+                        }
+                    }
+                    PinchUp::End { center } => inputs.push(PlatformInput::Pinch(PinchEvent {
+                        position: center,
+                        delta: 0.0,
+                        modifiers,
+                        phase: TouchPhase::Ended,
+                    })),
+                    PinchUp::Ignored => {}
+                },
+                _ => {}
+            }
+        }
+        for input in inputs {
+            dispatch_touch_input(&window_state, input);
         }
     }
 }
