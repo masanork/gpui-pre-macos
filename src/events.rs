@@ -276,6 +276,7 @@ pub(crate) unsafe fn platform_input_from_native(
                 };
 
                 PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    touch_fingers: 0,
                     position: point(
                         px(native_event.locationInWindow().x as f32),
                         window_height - px(native_event.locationInWindow().y as f32),
