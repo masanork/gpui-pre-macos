@@ -709,6 +709,9 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
+    display_link_running: bool,
+    frame_scheduled: bool,
+    idle_frames: u32,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -893,15 +896,30 @@ impl MacWindowState {
             return;
         };
         let data = self.native_view.as_ptr() as *mut c_void;
-        self.frame_source
+        if self
+            .frame_source
             .get_or_insert_with(|| WindowFrameSource::new(data, step))
             .start(display_id)
-            .log_err();
+            .log_err()
+            .is_some()
+        {
+            self.display_link_running = true;
+            self.idle_frames = 0;
+        }
     }
 
     fn stop_display_link(&mut self) {
         if let Some(frame_source) = self.frame_source.as_mut() {
             frame_source.stop();
+        }
+        self.display_link_running = false;
+    }
+
+    fn wake_display_link(&mut self) {
+        self.frame_scheduled = true;
+        self.idle_frames = 0;
+        if !self.display_link_running {
+            self.start_display_link();
         }
     }
 
@@ -1144,6 +1162,9 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
+                display_link_running: false,
+                frame_scheduled: true,
+                idle_frames: 0,
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -2064,6 +2085,19 @@ impl PlatformWindow for MacWindow {
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.as_ref().lock().request_frame_callback = Some(callback);
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let state = Arc::downgrade(&self.0);
+        Some(Rc::new(move || {
+            if let Some(state) = state.upgrade() {
+                state.lock().wake_display_link();
+            }
+        }))
+    }
+
+    fn schedule_frame(&self) {
+        self.0.lock().wake_display_link();
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>) {
@@ -3616,9 +3650,19 @@ extern "C" fn step(view: *mut c_void) {
     let mut lock = window_state.lock();
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
+        lock.frame_scheduled = false;
         drop(lock);
         callback(Default::default());
-        window_state.lock().request_frame_callback = Some(callback);
+        let mut lock = window_state.lock();
+        lock.request_frame_callback = Some(callback);
+        if lock.frame_scheduled {
+            lock.idle_frames = 0;
+        } else {
+            lock.idle_frames = lock.idle_frames.saturating_add(1);
+            if lock.idle_frames >= 4 {
+                lock.stop_display_link();
+            }
+        }
     }
 }
 
